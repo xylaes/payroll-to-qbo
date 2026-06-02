@@ -1,0 +1,12 @@
+*.csv
+*.xlsx
+venv/
+.venv/
+__pycache__/
+*.spec
+dist/
+build/
+salaried_splits.json
+AdditionalContext.txt
+*.pdf
+payroll_to_qbo/
