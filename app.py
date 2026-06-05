@@ -173,9 +173,56 @@ class PayrollTransformer:
         return distributed
 
     def transform(self, input_file, payroll_fees=0.0):
+        # Initialize audit properties
+        self.unmapped_details = []
+        self.is_balanced = True
+        self.total_debit = 0.0
+        self.total_credit = 0.0
+
         # 1. Load Data
         df = pd.read_csv(input_file)
         
+        # Scan for unmapped columns
+        recognized_cols = {
+            'Wages-Regular',
+            'Wages-Overtime',
+            'Wages-Other Non Taxable',
+            'Wages-Reimbursement - Non Taxable',
+            'Wages-Cell Phone Reimbursement',
+            'Ded-Child Support',
+            'Ded-Cell Phone-Uncollected',
+            'Ded-Dental-Uncollected',
+            'Ded-HSA Family (Medical $6350)-Uncollected',
+            'Ded-HSA Individual (Medical $5000)-Uncollected',
+            'Ded-HSA Individual (Medical $6350)-Uncollected',
+            'Ded-Medical-Uncollected',
+            'Ded-Simple IRA Roth-Uncollected',
+            'Ded-Simple IRA-Uncollected',
+            'Ded-Vision-Uncollected',
+            'Ded-Voluntary Term Life & AD&D-Uncollected',
+        }
+        
+        unmapped_cols = []
+        for col in df.columns:
+            if col.startswith("Wages-") or col.startswith("Ded-"):
+                if col in recognized_cols:
+                    continue
+                # Ignore division-specific breakdowns
+                is_breakdown = False
+                for div in ["Design Build", "Enhancement", "Connect", "Maintenance", "Indirect"]:
+                    if col.endswith(f"-{div}"):
+                        is_breakdown = True
+                        break
+                if "-ER-" in col or col.endswith("-Wage") or col.endswith("-EE"):
+                    is_breakdown = True
+                if is_breakdown:
+                    continue
+                
+                # Check if this column has non-zero values
+                non_zero_rows = df[df[col].notna() & (df[col] != 0)]
+                if not non_zero_rows.empty:
+                    unmapped_cols.append(col)
+
         # 2. Extract Date
         pay_date = self.extract_pay_date(df)
         
@@ -195,9 +242,6 @@ class PayrollTransformer:
                 other_nt = row.get('Wages-Other Non Taxable', 0) or row.get('Wages-Reimbursement - Non Taxable', 0)
                 if pd.isna(other_nt): other_nt = 0
                 wages += other_nt
-                bonus_referral = row.get('Wages-Bonus - Referral', 0)
-                if pd.isna(bonus_referral): bonus_referral = 0
-                wages += bonus_referral
                 
                 splits = self.get_salaried_split(emp_num, dept_name)
                 for qclass, pct in splits.items():
@@ -214,10 +258,8 @@ class PayrollTransformer:
                 if pd.isna(wages_indirect): wages_indirect = 0
                 wages_regular_generic = row.get('Wages-Regular', 0)
                 if pd.isna(wages_regular_generic): wages_regular_generic = 0
-                bonus_referral = row.get('Wages-Bonus - Referral', 0)
-                if pd.isna(bonus_referral): bonus_referral = 0
                 
-                total_wages = sum(wages_by_div.values()) + wages_indirect + wages_regular_generic + bonus_referral
+                total_wages = sum(wages_by_div.values()) + wages_indirect + wages_regular_generic
                 
                 splits = self.get_hourly_split(row)
                 for qclass, pct in splits.items():
@@ -274,11 +316,6 @@ class PayrollTransformer:
                 if pd.isna(other_nt): other_nt = 0
                 wages += other_nt
                 
-                # Referral Bonus
-                bonus_referral = row.get('Wages-Bonus - Referral', 0)
-                if pd.isna(bonus_referral): bonus_referral = 0
-                wages += bonus_referral
-                
                 net_wages = max(0.0, wages - child_support)
                 dist_wages = self.distribute_amount(net_wages, splits)
                 for qclass, val in dist_wages.items():
@@ -299,11 +336,7 @@ class PayrollTransformer:
                 wages_regular_generic = row.get('Wages-Regular', 0)
                 if pd.isna(wages_regular_generic): wages_regular_generic = 0
                 
-                # Referral Bonus
-                bonus_referral = row.get('Wages-Bonus - Referral', 0)
-                if pd.isna(bonus_referral): bonus_referral = 0
-                
-                total_wages = sum(wages_by_div.values()) + wages_indirect + wages_regular_generic + bonus_referral
+                total_wages = sum(wages_by_div.values()) + wages_indirect + wages_regular_generic
                 net_wages = max(0.0, total_wages - child_support)
                 
                 # Distribute regular wages
@@ -376,9 +409,7 @@ class PayrollTransformer:
                 'Ded-Simple IRA Roth-Uncollected': ('20700', 'Employee Ded (Liability):  Simple IRA Roth'),
                 'Ded-Simple IRA-Uncollected': ('20700', 'Employee Ded (Liability):  Simple IRA'),
                 'Ded-Vision-Uncollected': ('20575', 'Employee Ded (Liability):  Vision Plan'),
-                'Ded-Voluntary Term Life & AD&D-Uncollected': ('20560', 'Employee Ded (Liability):  Voluntary Term Life & AD&D'),
-                'Ded-Uniform-Uncollected': ('10.05', 'Employee Ded (Liability):  Uniform'),
-                'Ded-Materials purchase-Uncollected': ('10.05', 'Employee Ded (Liability):  Materials purchase')
+                'Ded-Voluntary Term Life & AD&D-Uncollected': ('20560', 'Employee Ded (Liability):  Voluntary Term Life & AD&D')
             }
             
             for col, (gl, memo) in deductions_map.items():
@@ -514,6 +545,26 @@ class PayrollTransformer:
             # Skip Employee Deductions Cash Req credit row since individual deductions are already credited
             pass
 
+            # ---------------- UNMAPPED COLUMNS (FLAGGED) ----------------
+            for col in unmapped_cols:
+                val = row.get(col, 0)
+                if pd.isna(val):
+                    val = 0
+                if val > 0:
+                    emp_name = f"{row.get('First Name', '')} {row.get('Last Name', '')}".strip() or f"Emp {emp_num}"
+                    self.unmapped_details.append({
+                        'employee': emp_name,
+                        'column': col,
+                        'value': val
+                    })
+                    
+                    dist = self.distribute_amount(val, splits)
+                    for qclass, amt in dist.items():
+                        if col.startswith("Wages-"):
+                            add_journal_row('[MISSING GL]', amt, 0, f'UNMAPPED: {col}', qclass, f"FLAGGED: Unmapped column '{col}' has value {val:.2f}")
+                        elif col.startswith("Ded-"):
+                            add_journal_row('[MISSING GL]', 0, amt, f'UNMAPPED: {col}', qclass, f"FLAGGED: Unmapped column '{col}' has value {val:.2f}")
+
         # Add manual payroll fees if provided
         if payroll_fees > 0:
             dist_fees = self.distribute_amount(payroll_fees, overall_splits)
@@ -536,8 +587,9 @@ class PayrollTransformer:
         total_debit = round(final_df['Debit'].sum(), 2)
         total_credit = round(final_df['Credit'].sum(), 2)
         
-        if total_debit != total_credit:
-            raise ValueError(f"Journal Entry Out of Balance! Debits: {total_debit}, Credits: {total_credit}")
+        self.total_debit = total_debit
+        self.total_credit = total_credit
+        self.is_balanced = abs(total_debit - total_credit) < 0.01
             
         return final_df
 
@@ -595,15 +647,8 @@ class PayrollApp:
         btn_browse = ttk.Button(browse_frame, text="Browse", command=self.browse_file)
         btn_browse.pack(side="right")
         
-        # Splits Editor Trigger
-        splits_frame = tk.Frame(main_card, bg=self.card_bg)
-        splits_frame.pack(fill="x", padx=20, pady=5)
-        tk.Label(splits_frame, text="Manage Salaried splits:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).pack(side="left", padx=(0, 10))
-        btn_splits = ttk.Button(splits_frame, text="Configure splits", style="Secondary.TButton", command=self.open_splits_window)
-        btn_splits.pack(side="left")
-
         # Run Button
-        self.btn_run = ttk.Button(main_card, text="Generate balanced QBO Journal Entry", command=self.process_data)
+        self.btn_run = ttk.Button(main_card, text="Generate QBO Journal Entry", command=self.process_data)
         self.btn_run.pack(pady=20, fill="x", padx=20)
         
         # Status Box
@@ -631,6 +676,46 @@ class PayrollApp:
             self.log("Reading file and applying transformation...\n")
             output_df = self.transformer.transform(self.file_path.get(), payroll_fees=0.0)
             
+            # Retrieve validation results
+            is_balanced = self.transformer.is_balanced
+            total_debit = self.transformer.total_debit
+            total_credit = self.transformer.total_credit
+            unmapped_details = self.transformer.unmapped_details
+            
+            # Format status logs
+            log_messages = []
+            
+            # 1. Double-Entry Bookkeeping Status
+            if is_balanced:
+                log_messages.append(f"DOUBLE-ENTRY BOOKKEEPING VALIDATION:\n  Status: BALANCED\n  Total Debits: ${total_debit:,.2f}\n  Total Credits: ${total_credit:,.2f}\n")
+            else:
+                diff = abs(total_debit - total_credit)
+                excess = "Debits exceed Credits" if total_debit > total_credit else "Credits exceed Debits"
+                log_messages.append(f"DOUBLE-ENTRY BOOKKEEPING VALIDATION:\n  Status: UNBALANCED\n  Total Debits: ${total_debit:,.2f}\n  Total Credits: ${total_credit:,.2f}\n  Difference: ${diff:,.2f} ({excess})\n")
+            
+            # 2. Unmapped Columns Status
+            if unmapped_details:
+                log_messages.append("UNMAPPED COLUMNS DETECTED:")
+                seen_warns = set()
+                for detail in unmapped_details:
+                    warn_key = (detail['employee'], detail['column'])
+                    if warn_key not in seen_warns:
+                        log_messages.append(f"  - Employee: {detail['employee']} | Column: {detail['column']} | Value: ${detail['value']:.2f}")
+                        seen_warns.add(warn_key)
+                
+                log_messages.append("\nTroubleshooting Action Required:")
+                log_messages.append("  These columns do not have GL mappings in the application.")
+                log_messages.append("  The output file has been generated with '[MISSING GL]' placeholders.")
+                log_messages.append("  To resolve this:")
+                log_messages.append("    1. Open your input CSV file manually.")
+                log_messages.append("    2. Rename the unmapped columns to a recognized header or correct the data.")
+                log_messages.append("    3. Save and retry the conversion.\n")
+            else:
+                log_messages.append("UNMAPPED COLUMNS:\n  Status: None detected (All processed columns mapped successfully)\n")
+                
+            self.log("\n".join(log_messages))
+            
+            # Proceed to save the output file regardless of balance status
             save_path = filedialog.asksaveasfilename(
                 defaultextension=".csv",
                 filetypes=[("CSV Files", "*.csv")],
@@ -639,127 +724,25 @@ class PayrollApp:
             
             if save_path:
                 output_df.to_csv(save_path, index=False)
-                self.log(f"SUCCESS: balanced Journal Entry generated.\nDebits: {output_df['Debit'].sum():.2f} | Credits: {output_df['Credit'].sum():.2f}\nSaved to: {os.path.basename(save_path)}")
-                messagebox.showinfo("Success", "QBO Journal Entry created successfully and balanced perfectly!")
+                
+                if unmapped_details and not is_balanced:
+                    status_title = "Completed with Warnings & Imbalances"
+                    status_msg = "Journal Entry saved, but it contains '[MISSING GL]' placeholders and is UNBALANCED. Please inspect the log and correct your input CSV."
+                elif unmapped_details:
+                    status_title = "Completed with Warnings"
+                    status_msg = "Journal Entry saved, but it contains '[MISSING GL]' placeholders. Please inspect the log."
+                elif not is_balanced:
+                    status_title = "Completed with Imbalances"
+                    status_msg = "Journal Entry saved, but it is UNBALANCED. Please inspect the log."
+                else:
+                    status_title = "Success"
+                    status_msg = "QBO Journal Entry created successfully and balanced perfectly!"
+                
+                messagebox.showinfo(status_title, status_msg)
                 
         except Exception as e:
             self.log(f"ERROR: {str(e)}")
             messagebox.showerror("Processing Error", str(e))
-
-    def open_splits_window(self):
-        """Opens split editor window."""
-        editor = tk.Toplevel(self.root)
-        editor.title("Salaried Splits Configurator")
-        editor.geometry("500x400")
-        editor.configure(bg=self.bg_color)
-        
-        ttk.Label(editor, text="Salaried Splits Editor", font=("Segoe UI", 12, "bold"), foreground=self.accent_color).pack(pady=10)
-        
-        list_frame = ttk.Frame(editor, style="Card.TFrame")
-        list_frame.pack(fill="both", expand=True, padx=20, pady=10)
-        
-        # Scrollable list of splits
-        splits = self.transformer.load_splits()
-        
-        canvas = tk.Canvas(list_frame, bg=self.card_bg, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=self.card_bg)
-        
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        entries = {}
-        
-        def render_splits():
-            for widget in scroll_frame.winfo_children():
-                widget.destroy()
-            
-            splits_data = self.transformer.load_splits()
-            for row_idx, (emp_num, split_dict) in enumerate(splits_data.items()):
-                row_f = tk.Frame(scroll_frame, bg=self.card_bg)
-                row_f.pack(fill="x", pady=5, padx=5)
-                
-                tk.Label(row_f, text=f"Emp {emp_num}:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 9, "bold")).pack(side="left", padx=5)
-                
-                split_str = ", ".join([f"{k.split(':')[-1]}:{int(v*100)}%" for k, v in split_dict.items()])
-                lbl_splits = tk.Label(row_f, text=split_str, bg=self.card_bg, fg=self.secondary_text, font=("Segoe UI", 9))
-                lbl_splits.pack(side="left", padx=10)
-                
-                # Delete Button
-                btn_del = ttk.Button(row_f, text="Delete", style="Secondary.TButton", 
-                                     command=lambda e=emp_num: delete_emp_split(e))
-                btn_del.pack(side="right", padx=5)
-        
-        def delete_emp_split(emp_num):
-            current_splits = self.transformer.load_splits()
-            if emp_num in current_splits:
-                del current_splits[emp_num]
-                self.transformer.save_splits(current_splits)
-                render_splits()
-
-        def add_split():
-            emp_val = ent_emp.get().strip()
-            if not emp_val:
-                messagebox.showerror("Error", "Employee number is required.")
-                return
-            
-            try:
-                # Basic input parse: class:pct, class:pct
-                split_val = ent_split.get().strip()
-                new_split = {}
-                total_pct = 0
-                for item in split_val.split(','):
-                    parts = item.split(':')
-                    if len(parts) != 2:
-                        raise ValueError("Format must be class_name:percentage")
-                    cname = parts[0].strip()
-                    # Resolve full class name
-                    full_class = cname
-                    for ck, cv in self.transformer.CLASS_MAP.items():
-                        if cname.lower() in cv.lower():
-                            full_class = cv
-                            break
-                    pct = float(parts[1].strip().replace('%', '')) / 100.0
-                    new_split[full_class] = pct
-                    total_pct += pct
-                
-                if abs(total_pct - 1.0) > 0.001:
-                    raise ValueError("Percentages must sum to 100%")
-                
-                current_splits = self.transformer.load_splits()
-                current_splits[emp_val] = new_split
-                self.transformer.save_splits(current_splits)
-                
-                ent_emp.delete(0, tk.END)
-                ent_split.delete(0, tk.END)
-                render_splits()
-                
-            except Exception as ex:
-                messagebox.showerror("Format Error", f"Could not parse split: {str(ex)}\nExample format: Design:50, Enhanc:50")
-
-        # Add new split section
-        add_frame = tk.Frame(editor, bg=self.card_bg)
-        add_frame.pack(fill="x", padx=20, pady=10)
-        
-        tk.Label(add_frame, text="Emp Number:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        ent_emp = ttk.Entry(add_frame, width=10)
-        ent_emp.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-        
-        tk.Label(add_frame, text="Split (e.g. Design:50, Maint:50):", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        ent_split = ttk.Entry(add_frame, width=30)
-        ent_split.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        
-        btn_add = ttk.Button(add_frame, text="Add/Update", command=add_split)
-        btn_add.grid(row=2, column=1, sticky="e", padx=5, pady=10)
-        
-        render_splits()
 
 if __name__ == "__main__":
     root = tk.Tk()

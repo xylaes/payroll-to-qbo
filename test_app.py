@@ -57,8 +57,8 @@ def test_balancing_logic(tmp_path):
     assert result_df['Debit'].sum() == result_df['Credit'].sum()
     assert result_df['Debit'].sum() == 1000.00
 
-def test_unbalanced_error(tmp_path):
-    # Unbalanced data should raise ValueError
+def test_unbalanced_non_blocking(tmp_path):
+    # Unbalanced data should NOT raise ValueError but set is_balanced to False
     bad_data = pd.DataFrame({
         'Employee Number': [1001],
         'Overtime Status': ['Non Exempt'],
@@ -71,8 +71,45 @@ def test_unbalanced_error(tmp_path):
     bad_data.to_csv(input_file, index=False)
     
     transformer = PayrollTransformer()
-    with pytest.raises(ValueError, match="Out of Balance"):
-        transformer.transform(input_file)
+    result_df = transformer.transform(input_file)
+    
+    # Assert successful run but marked as unbalanced
+    assert not transformer.is_balanced
+    assert transformer.total_debit == 1000.00
+    assert transformer.total_credit == 500.00
+    assert len(result_df) > 0
+
+def test_unmapped_column_flagging(tmp_path):
+    # Data with a brand-new/unmapped deduction column should generate [MISSING GL]
+    data = pd.DataFrame({
+        'Employee Number': [1001],
+        'Overtime Status': ['Non Exempt'],
+        'Department Name': ['Connect'],
+        'Division Name': ['Connect'],
+        'Wages-Regular-Connect': [1000.00],
+        'Total Direct Deposit Net': [950.00],
+        'Ded-Uniform-Uncollected': [50.00], # Unmapped!
+        'Total Uncollected Deductions': [50.00]
+    })
+    input_file = tmp_path / "unmapped_col_input.csv"
+    data.to_csv(input_file, index=False)
+    
+    transformer = PayrollTransformer()
+    result_df = transformer.transform(input_file)
+    
+    # Assert we flagged the unmapped column
+    assert len(transformer.unmapped_details) > 0
+    assert transformer.unmapped_details[0]['column'] == 'Ded-Uniform-Uncollected'
+    assert transformer.unmapped_details[0]['value'] == 50.00
+    
+    # Assert output contains the placeholder
+    missing_gl_rows = result_df[result_df['GL Code'] == '[MISSING GL]']
+    assert len(missing_gl_rows) > 0
+    assert missing_gl_rows.iloc[0]['Credit'] == 50.00
+    assert missing_gl_rows.iloc[0]['Memo'] == 'UNMAPPED: Ded-Uniform-Uncollected'
+    
+    # Check that it still balanced
+    assert transformer.is_balanced
 
 def test_real_world_payroll_balancing():
     input_file = "Complete Summary - Project Tracking_2743991.csv"
