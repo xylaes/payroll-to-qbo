@@ -99,3 +99,26 @@ def test_real_world_payroll_balancing():
     # Assert that no PII column details are in the output (they shouldn't be mapped to any QBO output field)
     for pii in PayrollTransformer.PII_COLUMNS:
         assert pii not in result_df.columns
+
+def test_feedback_v2_runs():
+    import glob
+    transformer = PayrollTransformer()
+    files = glob.glob('FeedbackV2/*.csv')
+    assert len(files) > 0, "No CSV files found in FeedbackV2/"
+    
+    for f in files:
+        # Test without fees
+        res_df = transformer.transform(f, payroll_fees=0.0)
+        total_debit = round(res_df['Debit'].sum(), 2)
+        total_credit = round(res_df['Credit'].sum(), 2)
+        assert total_debit == total_credit, f"File {f} without fees is out of balance! Debits: {total_debit}, Credits: {total_credit}"
+        
+        # Test with fees
+        res_df_fees = transformer.transform(f, payroll_fees=340.88)
+        total_debit_fees = round(res_df_fees['Debit'].sum(), 2)
+        total_credit_fees = round(res_df_fees['Credit'].sum(), 2)
+        assert total_debit_fees == total_credit_fees, f"File {f} with fees is out of balance! Debits: {total_debit_fees}, Credits: {total_credit_fees}"
+        
+        # Verify that fee difference is exactly 340.88
+        assert round(total_debit_fees - total_debit, 2) == 340.88
+

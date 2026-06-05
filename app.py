@@ -172,7 +172,7 @@ class PayrollTransformer:
             
         return distributed
 
-    def transform(self, input_file):
+    def transform(self, input_file, payroll_fees=0.0):
         # 1. Load Data
         df = pd.read_csv(input_file)
         
@@ -182,6 +182,53 @@ class PayrollTransformer:
         # 3. Security: Strip PII immediately
         df = self.clean_data(df)
         
+        # Calculate overall splits from the entire payroll for manual fee allocation
+        overall_class_wages = {c: 0.0 for c in self.CLASS_MAP.values()}
+        for _, row in df.iterrows():
+            emp_num = row.get('Employee Number')
+            is_exempt = row.get('Overtime Status') == 'Exempt'
+            dept_name = row.get('Department Name', '')
+            
+            if is_exempt:
+                wages = row.get('Wages-Regular', 0)
+                if pd.isna(wages): wages = 0
+                other_nt = row.get('Wages-Other Non Taxable', 0) or row.get('Wages-Reimbursement - Non Taxable', 0)
+                if pd.isna(other_nt): other_nt = 0
+                wages += other_nt
+                bonus_referral = row.get('Wages-Bonus - Referral', 0)
+                if pd.isna(bonus_referral): bonus_referral = 0
+                wages += bonus_referral
+                
+                splits = self.get_salaried_split(emp_num, dept_name)
+                for qclass, pct in splits.items():
+                    overall_class_wages[qclass] += wages * pct
+            else:
+                wages_by_div = {
+                    'Design Build': row.get('Wages-Regular-Design Build', 0),
+                    'Enhancement': row.get('Wages-Regular-Enhancement', 0),
+                    'Connect': row.get('Wages-Regular-Connect', 0),
+                    'Maintenance': row.get('Wages-Regular-Maintenance', 0)
+                }
+                wages_by_div = {k: (0 if pd.isna(v) else v) for k, v in wages_by_div.items()}
+                wages_indirect = row.get('Wages-Regular-Indirect', 0)
+                if pd.isna(wages_indirect): wages_indirect = 0
+                wages_regular_generic = row.get('Wages-Regular', 0)
+                if pd.isna(wages_regular_generic): wages_regular_generic = 0
+                bonus_referral = row.get('Wages-Bonus - Referral', 0)
+                if pd.isna(bonus_referral): bonus_referral = 0
+                
+                total_wages = sum(wages_by_div.values()) + wages_indirect + wages_regular_generic + bonus_referral
+                
+                splits = self.get_hourly_split(row)
+                for qclass, pct in splits.items():
+                    overall_class_wages[qclass] += total_wages * pct
+                    
+        total_overall_wages = sum(overall_class_wages.values())
+        if total_overall_wages > 0:
+            overall_splits = {k: v / total_overall_wages for k, v in overall_class_wages.items() if v > 0}
+        else:
+            overall_splits = {c: 0.25 for c in self.CLASS_MAP.values()}
+
         journal_rows = []
         
         def add_journal_row(gl_code, debit, credit, memo, qbo_class, notes=""):
@@ -222,10 +269,15 @@ class PayrollTransformer:
                 wages = row.get('Wages-Regular', 0)
                 if pd.isna(wages): wages = 0
                 
-                # Wages-Other Non Taxable for salaried matches regular wage GL
-                other_nt = row.get('Wages-Other Non Taxable', 0)
+                # Wages-Other Non Taxable or Wages-Reimbursement - Non Taxable for salaried matches regular wage GL
+                other_nt = row.get('Wages-Other Non Taxable', 0) or row.get('Wages-Reimbursement - Non Taxable', 0)
                 if pd.isna(other_nt): other_nt = 0
                 wages += other_nt
+                
+                # Referral Bonus
+                bonus_referral = row.get('Wages-Bonus - Referral', 0)
+                if pd.isna(bonus_referral): bonus_referral = 0
+                wages += bonus_referral
                 
                 net_wages = max(0.0, wages - child_support)
                 dist_wages = self.distribute_amount(net_wages, splits)
@@ -247,7 +299,11 @@ class PayrollTransformer:
                 wages_regular_generic = row.get('Wages-Regular', 0)
                 if pd.isna(wages_regular_generic): wages_regular_generic = 0
                 
-                total_wages = sum(wages_by_div.values()) + wages_indirect + wages_regular_generic
+                # Referral Bonus
+                bonus_referral = row.get('Wages-Bonus - Referral', 0)
+                if pd.isna(bonus_referral): bonus_referral = 0
+                
+                total_wages = sum(wages_by_div.values()) + wages_indirect + wages_regular_generic + bonus_referral
                 net_wages = max(0.0, total_wages - child_support)
                 
                 # Distribute regular wages
@@ -264,10 +320,34 @@ class PayrollTransformer:
                     add_journal_row(gl, val, 0, 'Wages Payable:  Regular', qclass)
                 
                 # Overtime
-                ot_wages = row.get('Wages-Overtime', 0)
-                if pd.isna(ot_wages): ot_wages = 0
-                if ot_wages > 0:
-                    dist_ot = self.distribute_amount(ot_wages, splits)
+                ot_by_div = {
+                    'Design Build': row.get('Wages-Overtime-Design Build', 0),
+                    'Enhancement': row.get('Wages-Overtime-Enhancement', 0),
+                    'Connect': row.get('Wages-Overtime-Connect', 0),
+                    'Maintenance': row.get('Wages-Overtime-Maintenance', 0)
+                }
+                ot_by_div = {k: (0 if pd.isna(v) else v) for k, v in ot_by_div.items()}
+                
+                ot_indirect = row.get('Wages-Overtime-Indirect', 0)
+                if pd.isna(ot_indirect): ot_indirect = 0
+                
+                ot_generic = row.get('Wages-Overtime', 0)
+                if pd.isna(ot_generic): ot_generic = 0
+                
+                direct_ot_total = sum(ot_by_div.values())
+                if direct_ot_total > 0 or ot_indirect > 0:
+                    if direct_ot_total > 0:
+                        ot_splits = {self.CLASS_MAP[k]: v / direct_ot_total for k, v in ot_by_div.items() if v > 0}
+                    else:
+                        ot_splits = splits
+                    dist_ot_indirect = self.distribute_amount(ot_indirect, ot_splits)
+                    for div_name, ot_val in ot_by_div.items():
+                        qclass = self.CLASS_MAP[div_name]
+                        val = ot_val + dist_ot_indirect.get(qclass, 0.0)
+                        gl = self.WAGE_OVERTIME_GL_MAP.get(div_name, '4.6.4')
+                        add_journal_row(gl, val, 0, 'Wages Payable:  Overtime', qclass)
+                elif ot_generic > 0:
+                    dist_ot = self.distribute_amount(ot_generic, splits)
                     for qclass, val in dist_ot.items():
                         div_key = 'Maintenance'
                         for dk, cv in self.CLASS_MAP.items():
@@ -296,7 +376,9 @@ class PayrollTransformer:
                 'Ded-Simple IRA Roth-Uncollected': ('20700', 'Employee Ded (Liability):  Simple IRA Roth'),
                 'Ded-Simple IRA-Uncollected': ('20700', 'Employee Ded (Liability):  Simple IRA'),
                 'Ded-Vision-Uncollected': ('20575', 'Employee Ded (Liability):  Vision Plan'),
-                'Ded-Voluntary Term Life & AD&D-Uncollected': ('20560', 'Employee Ded (Liability):  Voluntary Term Life & AD&D')
+                'Ded-Voluntary Term Life & AD&D-Uncollected': ('20560', 'Employee Ded (Liability):  Voluntary Term Life & AD&D'),
+                'Ded-Uniform-Uncollected': ('10.05', 'Employee Ded (Liability):  Uniform'),
+                'Ded-Materials purchase-Uncollected': ('10.05', 'Employee Ded (Liability):  Materials purchase')
             }
             
             for col, (gl, memo) in deductions_map.items():
@@ -432,6 +514,13 @@ class PayrollTransformer:
             # Skip Employee Deductions Cash Req credit row since individual deductions are already credited
             pass
 
+        # Add manual payroll fees if provided
+        if payroll_fees > 0:
+            dist_fees = self.distribute_amount(payroll_fees, overall_splits)
+            for qclass, amt in dist_fees.items():
+                add_journal_row('7.04.1', amt, 0, 'Payroll Processing Fees', qclass)
+                add_journal_row('20600', 0, amt, 'Payroll Cash Requirement: Payroll Fees', qclass)
+
         output_df = pd.DataFrame(journal_rows)
         
         # 5. Aggregation
@@ -506,13 +595,6 @@ class PayrollApp:
         btn_browse = ttk.Button(browse_frame, text="Browse", command=self.browse_file)
         btn_browse.pack(side="right")
         
-        # Splits Editor Trigger
-        splits_frame = tk.Frame(main_card, bg=self.card_bg)
-        splits_frame.pack(fill="x", padx=20, pady=15)
-        tk.Label(splits_frame, text="Manage Salaried splits:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).pack(side="left", padx=(0, 10))
-        btn_splits = ttk.Button(splits_frame, text="Configure splits", style="Secondary.TButton", command=self.open_splits_window)
-        btn_splits.pack(side="left")
-        
         # Run Button
         self.btn_run = ttk.Button(main_card, text="Generate balanced QBO Journal Entry", command=self.process_data)
         self.btn_run.pack(pady=20, fill="x", padx=20)
@@ -540,7 +622,7 @@ class PayrollApp:
         
         try:
             self.log("Reading file and applying transformation...\n")
-            output_df = self.transformer.transform(self.file_path.get())
+            output_df = self.transformer.transform(self.file_path.get(), payroll_fees=0.0)
             
             save_path = filedialog.asksaveasfilename(
                 defaultextension=".csv",
@@ -557,122 +639,8 @@ class PayrollApp:
             self.log(f"ERROR: {str(e)}")
             messagebox.showerror("Processing Error", str(e))
 
-    def open_splits_window(self):
-        """Opens split editor window."""
-        editor = tk.Toplevel(self.root)
-        editor.title("Salaried Splits Configurator")
-        editor.geometry("500x400")
-        editor.configure(bg=self.bg_color)
-        
-        ttk.Label(editor, text="Salaried Splits Editor", font=("Segoe UI", 12, "bold"), foreground=self.accent_color).pack(pady=10)
-        
-        list_frame = ttk.Frame(editor, style="Card.TFrame")
-        list_frame.pack(fill="both", expand=True, padx=20, pady=10)
-        
-        # Scrollable list of splits
-        splits = self.transformer.load_splits()
-        
-        canvas = tk.Canvas(list_frame, bg=self.card_bg, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=self.card_bg)
-        
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        entries = {}
-        
-        def render_splits():
-            for widget in scroll_frame.winfo_children():
-                widget.destroy()
-            
-            splits_data = self.transformer.load_splits()
-            for row_idx, (emp_num, split_dict) in enumerate(splits_data.items()):
-                row_f = tk.Frame(scroll_frame, bg=self.card_bg)
-                row_f.pack(fill="x", pady=5, padx=5)
-                
-                tk.Label(row_f, text=f"Emp {emp_num}:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 9, "bold")).pack(side="left", padx=5)
-                
-                split_str = ", ".join([f"{k.split(':')[-1]}:{int(v*100)}%" for k, v in split_dict.items()])
-                lbl_splits = tk.Label(row_f, text=split_str, bg=self.card_bg, fg=self.secondary_text, font=("Segoe UI", 9))
-                lbl_splits.pack(side="left", padx=10)
-                
-                # Delete Button
-                btn_del = ttk.Button(row_f, text="Delete", style="Secondary.TButton", 
-                                     command=lambda e=emp_num: delete_emp_split(e))
-                btn_del.pack(side="right", padx=5)
-        
-        def delete_emp_split(emp_num):
-            current_splits = self.transformer.load_splits()
-            if emp_num in current_splits:
-                del current_splits[emp_num]
-                self.transformer.save_splits(current_splits)
-                render_splits()
-
-        def add_split():
-            emp_val = ent_emp.get().strip()
-            if not emp_val:
-                messagebox.showerror("Error", "Employee number is required.")
-                return
-            
-            try:
-                # Basic input parse: class:pct, class:pct
-                split_val = ent_split.get().strip()
-                new_split = {}
-                total_pct = 0
-                for item in split_val.split(','):
-                    parts = item.split(':')
-                    if len(parts) != 2:
-                        raise ValueError("Format must be class_name:percentage")
-                    cname = parts[0].strip()
-                    # Resolve full class name
-                    full_class = cname
-                    for ck, cv in self.transformer.CLASS_MAP.items():
-                        if cname.lower() in cv.lower():
-                            full_class = cv
-                            break
-                    pct = float(parts[1].strip().replace('%', '')) / 100.0
-                    new_split[full_class] = pct
-                    total_pct += pct
-                
-                if abs(total_pct - 1.0) > 0.001:
-                    raise ValueError("Percentages must sum to 100%")
-                
-                current_splits = self.transformer.load_splits()
-                current_splits[emp_val] = new_split
-                self.transformer.save_splits(current_splits)
-                
-                ent_emp.delete(0, tk.END)
-                ent_split.delete(0, tk.END)
-                render_splits()
-                
-            except Exception as ex:
-                messagebox.showerror("Format Error", f"Could not parse split: {str(ex)}\nExample format: Design:50, Enhanc:50")
-
-        # Add new split section
-        add_frame = tk.Frame(editor, bg=self.card_bg)
-        add_frame.pack(fill="x", padx=20, pady=10)
-        
-        tk.Label(add_frame, text="Emp Number:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        ent_emp = ttk.Entry(add_frame, width=10)
-        ent_emp.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-        
-        tk.Label(add_frame, text="Split (e.g. Design:50, Maint:50):", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        ent_split = ttk.Entry(add_frame, width=30)
-        ent_split.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        
-        btn_add = ttk.Button(add_frame, text="Add/Update", command=add_split)
-        btn_add.grid(row=2, column=1, sticky="e", padx=5, pady=10)
-        
-        render_splits()
-
 if __name__ == "__main__":
     root = tk.Tk()
     app = PayrollApp(root)
     root.mainloop()
+
