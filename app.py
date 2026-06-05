@@ -595,6 +595,13 @@ class PayrollApp:
         btn_browse = ttk.Button(browse_frame, text="Browse", command=self.browse_file)
         btn_browse.pack(side="right")
         
+        # Splits Editor Trigger
+        splits_frame = tk.Frame(main_card, bg=self.card_bg)
+        splits_frame.pack(fill="x", padx=20, pady=5)
+        tk.Label(splits_frame, text="Manage Salaried splits:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).pack(side="left", padx=(0, 10))
+        btn_splits = ttk.Button(splits_frame, text="Configure splits", style="Secondary.TButton", command=self.open_splits_window)
+        btn_splits.pack(side="left")
+
         # Run Button
         self.btn_run = ttk.Button(main_card, text="Generate balanced QBO Journal Entry", command=self.process_data)
         self.btn_run.pack(pady=20, fill="x", padx=20)
@@ -638,6 +645,121 @@ class PayrollApp:
         except Exception as e:
             self.log(f"ERROR: {str(e)}")
             messagebox.showerror("Processing Error", str(e))
+
+    def open_splits_window(self):
+        """Opens split editor window."""
+        editor = tk.Toplevel(self.root)
+        editor.title("Salaried Splits Configurator")
+        editor.geometry("500x400")
+        editor.configure(bg=self.bg_color)
+        
+        ttk.Label(editor, text="Salaried Splits Editor", font=("Segoe UI", 12, "bold"), foreground=self.accent_color).pack(pady=10)
+        
+        list_frame = ttk.Frame(editor, style="Card.TFrame")
+        list_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        # Scrollable list of splits
+        splits = self.transformer.load_splits()
+        
+        canvas = tk.Canvas(list_frame, bg=self.card_bg, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg=self.card_bg)
+        
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        entries = {}
+        
+        def render_splits():
+            for widget in scroll_frame.winfo_children():
+                widget.destroy()
+            
+            splits_data = self.transformer.load_splits()
+            for row_idx, (emp_num, split_dict) in enumerate(splits_data.items()):
+                row_f = tk.Frame(scroll_frame, bg=self.card_bg)
+                row_f.pack(fill="x", pady=5, padx=5)
+                
+                tk.Label(row_f, text=f"Emp {emp_num}:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 9, "bold")).pack(side="left", padx=5)
+                
+                split_str = ", ".join([f"{k.split(':')[-1]}:{int(v*100)}%" for k, v in split_dict.items()])
+                lbl_splits = tk.Label(row_f, text=split_str, bg=self.card_bg, fg=self.secondary_text, font=("Segoe UI", 9))
+                lbl_splits.pack(side="left", padx=10)
+                
+                # Delete Button
+                btn_del = ttk.Button(row_f, text="Delete", style="Secondary.TButton", 
+                                     command=lambda e=emp_num: delete_emp_split(e))
+                btn_del.pack(side="right", padx=5)
+        
+        def delete_emp_split(emp_num):
+            current_splits = self.transformer.load_splits()
+            if emp_num in current_splits:
+                del current_splits[emp_num]
+                self.transformer.save_splits(current_splits)
+                render_splits()
+
+        def add_split():
+            emp_val = ent_emp.get().strip()
+            if not emp_val:
+                messagebox.showerror("Error", "Employee number is required.")
+                return
+            
+            try:
+                # Basic input parse: class:pct, class:pct
+                split_val = ent_split.get().strip()
+                new_split = {}
+                total_pct = 0
+                for item in split_val.split(','):
+                    parts = item.split(':')
+                    if len(parts) != 2:
+                        raise ValueError("Format must be class_name:percentage")
+                    cname = parts[0].strip()
+                    # Resolve full class name
+                    full_class = cname
+                    for ck, cv in self.transformer.CLASS_MAP.items():
+                        if cname.lower() in cv.lower():
+                            full_class = cv
+                            break
+                    pct = float(parts[1].strip().replace('%', '')) / 100.0
+                    new_split[full_class] = pct
+                    total_pct += pct
+                
+                if abs(total_pct - 1.0) > 0.001:
+                    raise ValueError("Percentages must sum to 100%")
+                
+                current_splits = self.transformer.load_splits()
+                current_splits[emp_val] = new_split
+                self.transformer.save_splits(current_splits)
+                
+                ent_emp.delete(0, tk.END)
+                ent_split.delete(0, tk.END)
+                render_splits()
+                
+            except Exception as ex:
+                messagebox.showerror("Format Error", f"Could not parse split: {str(ex)}\nExample format: Design:50, Enhanc:50")
+
+        # Add new split section
+        add_frame = tk.Frame(editor, bg=self.card_bg)
+        add_frame.pack(fill="x", padx=20, pady=10)
+        
+        tk.Label(add_frame, text="Emp Number:", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        ent_emp = ttk.Entry(add_frame, width=10)
+        ent_emp.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        
+        tk.Label(add_frame, text="Split (e.g. Design:50, Maint:50):", bg=self.card_bg, fg=self.text_color, font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        ent_split = ttk.Entry(add_frame, width=30)
+        ent_split.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+        
+        btn_add = ttk.Button(add_frame, text="Add/Update", command=add_split)
+        btn_add.grid(row=2, column=1, sticky="e", padx=5, pady=10)
+        
+        render_splits()
 
 if __name__ == "__main__":
     root = tk.Tk()

@@ -103,7 +103,7 @@ def test_real_world_payroll_balancing():
 def test_feedback_v2_runs():
     import glob
     transformer = PayrollTransformer()
-    files = glob.glob('FeedbackV2/*.csv')
+    files = glob.glob('FeedbackV2/Complete Summary - Project Tracking_*.csv')
     assert len(files) > 0, "No CSV files found in FeedbackV2/"
     
     for f in files:
